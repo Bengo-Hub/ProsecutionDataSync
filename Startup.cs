@@ -152,10 +152,13 @@ namespace ProsecutionDataSync
         {
             _logger.LogInformation("Fetching and syncing data...");
 
-            // Fetch and sync data for each table
-            await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("invoicing", "api/invoicing"), "FetchAndSyncTable-invoicing", CancellationToken.None);
-            await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("caseresults", "api/caseresults"), "FetchAndSyncTable-caseresults", CancellationToken.None);
-            await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("receipt", "api/receipt"), "FetchAndSyncTable-receipt", CancellationToken.None);
+            // Fetch and sync data in the correct order to preserve relationships
+            //await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("casedetails", "api/casedetails"), "FetchAndSyncTable-casedetails", CancellationToken.None);
+            //await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("casedocs", "api/casedocs"), "FetchAndSyncTable-casedocs", CancellationToken.None);
+            //await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("invoicing", "api/invoicing"), "FetchAndSyncTable-invoicing", CancellationToken.None);
+            //await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("receipt", "api/receipt"), "FetchAndSyncTable-receipt", CancellationToken.None);
+            //await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("caseresults", "api/caseresults"), "FetchAndSyncTable-caseresults", CancellationToken.None);
+            await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("eacact", "api/eacact"), "FetchAndSyncTable-eacact", CancellationToken.None);
 
             _logger.LogInformation("Data sync completed for all tables.");
         }
@@ -188,7 +191,7 @@ namespace ProsecutionDataSync
                 try
                 {
                     // Remove the 'id' field before sending to the central API
-                    var dataWithoutId = RemoveIdField(data);
+                    var dataWithoutId = data;//RemoveIdField(data);
 
                     // Send data to the central API
                     await RetryWithExponentialBackoff(async () => await SendToCentralApi(endpoint, dataWithoutId), $"SendToCentralApi-{endpoint}", CancellationToken.None);
