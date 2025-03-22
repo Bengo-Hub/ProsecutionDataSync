@@ -85,8 +85,8 @@ namespace ProsecutionDataSync
                 try
                 {
                     _logger.LogInformation("Starting data sync process...");
-                    await LoginAndGetToken();
-                    await SyncData();
+                    await RetryWithExponentialBackoff(async () => await LoginAndGetToken(), "LoginAndGetToken", stoppingToken);
+                    await RetryWithExponentialBackoff(async () => await SyncData(), "SyncData", stoppingToken);
                     _logger.LogInformation("Data sync process completed successfully.");
                 }
                 catch (Exception ex)
@@ -98,168 +98,129 @@ namespace ProsecutionDataSync
             }
         }
 
-        private async Task LoginAndGetToken()
+        private async Task RetryWithExponentialBackoff(Func<Task> action, string actionName, CancellationToken stoppingToken, int maxRetryCount = 5)
         {
-            try
+            int retryCount = 0;
+            while (true)
             {
-                _logger.LogInformation("Attempting to log in and retrieve JWT token...");
-                var loginData = new { email = "admin@admin.com", password = "@Admin123" };
-                var response = await _httpClient.PostAsync(
-                    $"{_localApiBaseUrl}api/authmanagement/login",
-                    new StringContent(JsonSerializer.Serialize(loginData), Encoding.UTF8, "application/json")
-                );
-
-                if (response.IsSuccessStatusCode)
+                try
                 {
-                    var result = await response.Content.ReadAsStringAsync();
-                    var tokenResponse = JsonSerializer.Deserialize<JsonElement>(result);
-                    _jwtToken = tokenResponse.GetProperty("token").GetString();
-                    _httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _jwtToken);
-                    _logger.LogInformation("JWT token retrieved successfully.");
+                    await action();
+                    break;
                 }
-                else
+                catch (Exception ex)
                 {
-                    _logger.LogError("Failed to get JWT token");
+                    retryCount++;
+                    if (retryCount > maxRetryCount)
+                    {
+                        _logger.LogError(ex, $"Max retry count reached for {actionName}");
+                        throw;
+                    }
+
+                    int delay = (int)Math.Pow(2, retryCount) * 1000; // Exponential backoff
+                    _logger.LogWarning(ex, $"Error in {actionName}, retrying in {delay}ms...");
+                    await Task.Delay(delay, stoppingToken);
                 }
             }
-            catch (Exception ex)
+        }
+
+        private async Task LoginAndGetToken()
+        {
+            _logger.LogInformation("Attempting to log in and retrieve JWT token...");
+            var loginData = new { email = "admin@admin.com", password = "@Admin123" };
+            var response = await _httpClient.PostAsync(
+                $"{_localApiBaseUrl}api/authmanagement/login",
+                new StringContent(JsonSerializer.Serialize(loginData), Encoding.UTF8, "application/json")
+            );
+
+            if (response.IsSuccessStatusCode)
             {
-                _logger.LogError(ex, "Error during login");
-                throw;
+                var result = await response.Content.ReadAsStringAsync();
+                var tokenResponse = JsonSerializer.Deserialize<JsonElement>(result);
+                _jwtToken = tokenResponse.GetProperty("token").GetString();
+                _httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _jwtToken);
+                _logger.LogInformation("JWT token retrieved successfully.");
+            }
+            else
+            {
+                _logger.LogError("Failed to get JWT token");
+                throw new Exception("Failed to get JWT token");
             }
         }
 
         private async Task SyncData()
         {
-            try
-            {
-                _logger.LogInformation("Fetching and syncing data...");
+            _logger.LogInformation("Fetching and syncing data...");
 
-                // Fetch and sync data for each table
-                //await FetchAndSyncTable("casedetails", "api/casedetails");
-                //await FetchAndSyncTable("casedocs", "api/casedocs");
-                //await FetchAndSyncTable("eacact", "api/eacact");
-                await FetchAndSyncTable("invoicing", "api/invoicing");
-                await FetchAndSyncTable("caseresults", "api/caseresults");
-                await FetchAndSyncTable("receipt", "api/receipt");
+            // Fetch and sync data for each table
+            await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("invoicing", "api/invoicing"), "FetchAndSyncTable-invoicing", CancellationToken.None);
+            await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("caseresults", "api/caseresults"), "FetchAndSyncTable-caseresults", CancellationToken.None);
+            await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("receipt", "api/receipt"), "FetchAndSyncTable-receipt", CancellationToken.None);
 
-                _logger.LogInformation("Data sync completed for all tables.");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error during data sync");
-            }
-        }
-        private async Task<bool> CheckIfExists(string url)
-        {
-            try
-            {
-                _logger.LogInformation($"Checking existence at: {url}");
-                var response = await _httpClient.GetAsync(url);
-
-                if (response.IsSuccessStatusCode)
-                {
-                    var content = await response.Content.ReadAsStringAsync();
-                    _logger.LogInformation($"Raw response from {url}: {content}");
-
-                    // Attempt to deserialize only if the content is valid JSON
-                    try
-                    {
-                        var data = JsonSerializer.Deserialize<List<JsonElement>>(content);
-                        return data != null && data.Count > 0;
-                    }
-                    catch (JsonException ex)
-                    {
-                        _logger.LogError(ex, $"Failed to deserialize response from {url}. Response content: {content}");
-                        return false;
-                    }
-                }
-                else
-                {
-                    _logger.LogError($"API call to {url} failed with status code: {response.StatusCode}");
-                    return false;
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, $"Error checking existence at {url}");
-                return false;
-            }
+            _logger.LogInformation("Data sync completed for all tables.");
         }
 
         private async Task FetchAndSyncTable(string tableName, string endpoint)
         {
-            try
+            _logger.LogInformation($"Fetching data from {tableName}...");
+
+            // Fetch data from the local API
+            var response = await _httpClient.GetAsync($"{_localApiBaseUrl}api/{tableName}");
+            if (!response.IsSuccessStatusCode)
             {
-                _logger.LogInformation($"Fetching data from {tableName}...");
-
-                // Fetch data from the local API
-                var response = await _httpClient.GetAsync($"{_localApiBaseUrl}api/{tableName}");
-                if (!response.IsSuccessStatusCode)
-                {
-                    _logger.LogError($"Failed to fetch data from {tableName}");
-                    return;
-                }
-
-                var content = await response.Content.ReadAsStringAsync();
-                var dataList = JsonSerializer.Deserialize<List<JsonElement>>(content);
-
-                if (dataList == null || !dataList.Any())
-                {
-                    _logger.LogInformation($"No data found in {tableName}");
-                    return;
-                }
-
-                _logger.LogInformation($"Processing {dataList.Count} records from {tableName}...");
-
-                foreach (var data in dataList)
-                {
-                    try
-                    {
-                        // Remove the 'id' field before sending to the central API
-                        var dataWithoutId = data; //RemoveIdField(data);
-
-                        // Send data to the central API
-                        await SendToCentralApi(endpoint, dataWithoutId);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, $"Error processing record from {tableName}");
-                    }
-                }
-
-                _logger.LogInformation($"Data sync completed for {tableName}.");
+                _logger.LogError($"Failed to fetch data from {tableName}");
+                throw new Exception($"Failed to fetch data from {tableName}");
             }
-            catch (Exception ex)
+
+            var content = await response.Content.ReadAsStringAsync();
+            var dataList = JsonSerializer.Deserialize<List<JsonElement>>(content);
+
+            if (dataList == null || !dataList.Any())
             {
-                _logger.LogError(ex, $"Error fetching and syncing data from {tableName}");
+                _logger.LogInformation($"No data found in {tableName}");
+                return;
             }
+
+            _logger.LogInformation($"Processing {dataList.Count} records from {tableName}...");
+
+            foreach (var data in dataList)
+            {
+                try
+                {
+                    // Remove the 'id' field before sending to the central API
+                    var dataWithoutId = RemoveIdField(data);
+
+                    // Send data to the central API
+                    await RetryWithExponentialBackoff(async () => await SendToCentralApi(endpoint, dataWithoutId), $"SendToCentralApi-{endpoint}", CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, $"Error processing record from {tableName}");
+                }
+            }
+
+            _logger.LogInformation($"Data sync completed for {tableName}.");
         }
 
         private async Task SendToCentralApi(string endpoint, JsonElement data)
         {
-            try
-            {
-                _logger.LogInformation($"Sending data to {endpoint}");
-                var response = await _httpClient.PostAsync(
-                    $"{_centralApiBaseUrl}{endpoint}",
-                    new StringContent(data.ToString(), Encoding.UTF8, "application/json")
-                );
+            _logger.LogInformation($"Sending data to {endpoint}");
+            var response = await _httpClient.PostAsync(
+                $"{_centralApiBaseUrl}{endpoint}",
+                new StringContent(data.ToString(), Encoding.UTF8, "application/json")
+            );
 
-                if (!response.IsSuccessStatusCode)
-                {
-                    _logger.LogError($"Failed to send data to {endpoint}");
-                }
-                else
-                {
-                    _logger.LogInformation($"Successfully synced data to {endpoint}");
-                }
-            }
-            catch (Exception ex)
+            if (!response.IsSuccessStatusCode)
             {
-                _logger.LogError(ex, $"Error sending data to {endpoint}");
+                _logger.LogError($"Failed to send data to {endpoint}");
+                throw new Exception($"Failed to send data to {endpoint}");
+            }
+            else
+            {
+                _logger.LogInformation($"Successfully synced data to {endpoint}");
             }
         }
+
         private JsonElement RemoveIdField(JsonElement data)
         {
             try
