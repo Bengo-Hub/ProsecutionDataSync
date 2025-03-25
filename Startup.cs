@@ -23,15 +23,9 @@ namespace ProsecutionDataSync
 {
     public class Startup
     {
-        private readonly HttpClient _httpClient;
-        private string _jwtToken;
-        private readonly string _localApiBaseUrl = "https://localhost:44365/";
-        private readonly string _centralApiBaseUrl = "https://kenload.kenha.co.ke:4444/";
-
         public Startup(IConfiguration configuration)
         {
             Configuration = configuration;
-            _httpClient = new HttpClient();
         }
 
         public IConfiguration Configuration { get; }
@@ -98,7 +92,7 @@ namespace ProsecutionDataSync
             }
         }
 
-        private async Task RetryWithExponentialBackoff(Func<Task> action, string actionName, CancellationToken stoppingToken, int maxRetryCount = 5)
+        private async Task RetryWithExponentialBackoff(Func<Task> action, string actionName, CancellationToken stoppingToken, int maxRetryCount = 3)
         {
             int retryCount = 0;
             while (true)
@@ -107,6 +101,31 @@ namespace ProsecutionDataSync
                 {
                     await action();
                     break;
+                }
+                catch (Exception ex)
+                {
+                    retryCount++;
+                    if (retryCount > maxRetryCount)
+                    {
+                        _logger.LogError(ex, $"Max retry count reached for {actionName}");
+                        break; // Exit loop
+                    }
+
+                    int delay = (int)Math.Pow(2, retryCount) * 1000; // Exponential backoff
+                    _logger.LogWarning(ex, $"Error in {actionName}, retrying in {delay}ms...");
+                    await Task.Delay(delay, stoppingToken);
+                }
+            }
+        }
+
+        private async Task<T> RetryWithExponentialBackoff<T>(Func<Task<T>> action, string actionName, CancellationToken stoppingToken, int maxRetryCount = 3)
+        {
+            int retryCount = 0;
+            while (true)
+            {
+                try
+                {
+                    return await action();
                 }
                 catch (Exception ex)
                 {
@@ -152,79 +171,323 @@ namespace ProsecutionDataSync
         {
             _logger.LogInformation("Fetching and syncing data...");
 
-            // Fetch and sync data in the correct order to preserve relationships
-            //await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("casedetails", "api/casedetails"), "FetchAndSyncTable-casedetails", CancellationToken.None);
-            //await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("casedocs", "api/casedocs"), "FetchAndSyncTable-casedocs", CancellationToken.None);
-            //await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("invoicing", "api/invoicing"), "FetchAndSyncTable-invoicing", CancellationToken.None);
-            //await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("receipt", "api/receipt"), "FetchAndSyncTable-receipt", CancellationToken.None);
-            //await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("caseresults", "api/caseresults"), "FetchAndSyncTable-caseresults", CancellationToken.None);
-            await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("eacact", "api/eacact"), "FetchAndSyncTable-eacact", CancellationToken.None);
+            // Start with the root table (casedetails)
+            await RetryWithExponentialBackoff(async () => await FetchAndSyncTable("casedetails", "api/casedetails"), "FetchAndSyncTable-casedetails", CancellationToken.None);
 
             _logger.LogInformation("Data sync completed for all tables.");
         }
 
-        private async Task FetchAndSyncTable(string tableName, string endpoint)
+        private async Task FetchAndSyncTable(string tableName, string endpoint, int limit = 1, int offset = 0)
         {
-            _logger.LogInformation($"Fetching data from {tableName}...");
-
-            // Fetch data from the local API
-            var response = await _httpClient.GetAsync($"{_localApiBaseUrl}api/{tableName}");
-            if (!response.IsSuccessStatusCode)
+            while (true)
             {
-                _logger.LogError($"Failed to fetch data from {tableName}");
-                throw new Exception($"Failed to fetch data from {tableName}");
-            }
+                _logger.LogInformation($"Fetching data from {tableName} with offset {offset}...");
 
-            var content = await response.Content.ReadAsStringAsync();
-            var dataList = JsonSerializer.Deserialize<List<JsonElement>>(content);
-
-            if (dataList == null || !dataList.Any())
-            {
-                _logger.LogInformation($"No data found in {tableName}");
-                return;
-            }
-
-            _logger.LogInformation($"Processing {dataList.Count} records from {tableName}...");
-
-            foreach (var data in dataList)
-            {
-                try
+                string filterQuery = $"?exported=0&limit={limit}&offset={offset}";
+                switch (tableName.ToLower())
                 {
-                    // Remove the 'id' field before sending to the central API
-                    var dataWithoutId = data;//RemoveIdField(data);
+                    case "invoicing":
+                        filterQuery += "&deleted=0";
+                        break;
+                    case "casedocs":
+                        filterQuery += "&cancelled=N";
+                        break;
+                }
 
-                    // Send data to the central API
-                    await RetryWithExponentialBackoff(async () => await SendToCentralApi(endpoint, dataWithoutId), $"SendToCentralApi-{endpoint}", CancellationToken.None);
-                }
-                catch (Exception ex)
+                var response = await _httpClient.GetAsync($"{_localApiBaseUrl}api/{tableName}/search/{filterQuery}");
+                if (!response.IsSuccessStatusCode)
                 {
-                    _logger.LogError(ex, $"Error processing record from {tableName}");
+                    _logger.LogError($"Failed to fetch data from {tableName}");
+                    throw new Exception($"Failed to fetch data from {tableName}");
                 }
+
+                var content = await response.Content.ReadAsStringAsync();
+                var dataList = JsonSerializer.Deserialize<List<JsonElement>>(content);
+
+                if (dataList == null || !dataList.Any())
+                {
+                    _logger.LogInformation($"No more data found in {tableName}.");
+                    break;
+                }
+
+                _logger.LogInformation($"Processing {dataList.Count} records from {tableName}...");
+
+                foreach (var data in dataList)
+                {
+                    try
+                    {
+                        // Sync the parent record and all its children recursively
+                        await SyncRecordAndChildren(tableName, endpoint, data);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, $"Error processing record from {tableName}");
+                    }
+                }
+
+                offset += limit;
             }
 
             _logger.LogInformation($"Data sync completed for {tableName}.");
         }
 
-        private async Task SendToCentralApi(string endpoint, JsonElement data)
+        private async Task SyncRecordAndChildren(string tableName, string endpoint, JsonElement data)
         {
-            _logger.LogInformation($"Sending data to {endpoint}");
-            var response = await _httpClient.PostAsync(
-                $"{_centralApiBaseUrl}{endpoint}",
-                new StringContent(data.ToString(), Encoding.UTF8, "application/json")
+            // First check if this record should be synced based on business rules
+            if (!await ShouldSyncRecord(tableName, data))
+            {
+                _logger.LogInformation($"Skipping {tableName} record as it doesn't meet sync criteria");
+                return;
+            }
+
+            // Send the parent record to the central API and get the new ID
+            int newParentId = await RetryWithExponentialBackoff<int>(
+                async () => await SendToCentralApi(endpoint, ParseToJsonElement(data)),
+                $"SendToCentralApi-{endpoint}",
+                CancellationToken.None
             );
 
-            if (!response.IsSuccessStatusCode)
+            if (newParentId == -1)
             {
-                _logger.LogError($"Failed to send data to {endpoint}");
-                throw new Exception($"Failed to send data to {endpoint}");
+                return; // Skip if the parent record was not posted
             }
-            else
+
+            // Get all child records for this parent
+            var childrenToSync = GetChildTablesToSync(tableName);
+
+            foreach (var childTable in childrenToSync)
             {
-                _logger.LogInformation($"Successfully synced data to {endpoint}");
+                var childRecords = await FetchChildRecords(childTable.TableName, childTable.ForeignKey,
+                    childTable.IsForeignKeyInt ? (object)data.GetProperty(childTable.LocalKey).GetInt32() :
+                                               data.GetProperty(childTable.LocalKey).GetString());
+
+                if (childRecords.Any())
+                {
+                    _logger.LogInformation($"Found {childRecords.Count} child records in {childTable.TableName} for parent {tableName}");
+
+                    foreach (var childRecord in childRecords)
+                    {
+                        // Recursively sync each child record and its children
+                        await SyncRecordAndChildren(
+                            childTable.TableName,
+                            $"api/{childTable.TableName}",
+                            UpdateForeignKey(childRecord, tableName, newParentId, data)
+                        );
+                    }
+                }
             }
         }
 
-        private JsonElement RemoveIdField(JsonElement data)
+        private async Task<bool> ShouldSyncRecord(string tableName, JsonElement data)
+        {
+            // Apply table-specific sync rules
+            switch (tableName.ToLower())
+            {
+                case "casedetails":
+                    // Only sync casedetails if it has corresponding eacact or invoicing records
+                    var hasEacact = (await FetchChildRecords("eacact", "caseid", data.GetProperty("caseid").GetString())).Any();
+                    var hasInvoicing = (await FetchChildRecords("invoicing", "caseid", data.GetProperty("caseid").GetString())).Any();
+                    return hasEacact || hasInvoicing;
+
+                case "invoicing":
+                    // Only send invoices whose parent casedocs cancelled status is 'N'
+                    return await IsParentCasedocsNotCancelled(data);
+
+                default:
+                    return true;
+            }
+        }
+
+        private List<ChildTableInfo> GetChildTablesToSync(string parentTableName)
+        {
+            var children = new List<ChildTableInfo>();
+
+            switch (parentTableName.ToLower())
+            {
+                case "casedetails":
+                    children.Add(new ChildTableInfo("casedocs", "casedetailsid", "id", false));
+                    children.Add(new ChildTableInfo("caseresults", "casedetailsid", "id", false));
+                    children.Add(new ChildTableInfo("eacact", "caseid", "caseid", false));
+                    children.Add(new ChildTableInfo("invoicing", "caseid", "caseid", false));
+                    break;
+
+                case "casedocs":
+                    children.Add(new ChildTableInfo("invoicing", "casedocsid", "id", true));
+                    break;
+
+                case "invoicing":
+                    children.Add(new ChildTableInfo("receipt", "invoicingid", "id", true));
+                    break;
+            }
+
+            return children;
+        }
+
+        private async Task<int> SendToCentralApi(string endpoint, JsonElement data)
+        {
+            var tableName = endpoint.Split("/")[1];
+            var cleanedData = CleanData(data);
+            var dataWithoutId = RemoveIdField(cleanedData);
+
+            _logger.LogInformation($"Sending cleaned data to {endpoint}: {dataWithoutId}");
+
+            if (await IsDuplicateRecord(endpoint, dataWithoutId))
+            {
+                _logger.LogWarning($"Duplicate record detected at {endpoint}. Skipping...");
+                return -1;
+            }
+
+            var response = await _httpClient.PostAsync(
+                $"{_centralApiBaseUrl}{endpoint}",
+                new StringContent(dataWithoutId.ToString(), Encoding.UTF8, "application/json")
+            );
+
+            var responseContent = await response.Content.ReadAsStringAsync();
+            var responseData = JsonSerializer.Deserialize<JsonElement>(responseContent);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
+                {
+                    _logger.LogWarning($"Duplicate record detected at {endpoint}. Skipping...");
+                    return -1;
+                }
+
+                _logger.LogError($"Failed to send data to {endpoint}");
+                _logger.LogInformation($"Error Response from {endpoint}: {responseData}");
+                throw new Exception($"Failed to send data to {endpoint}");
+            }
+
+            _logger.LogInformation($"Response from {endpoint}: {responseData}");
+
+            if (responseData.TryGetProperty("id", out var newId))
+            {
+                await UpdateExportedStatus(tableName, data);
+                _logger.LogInformation($"Successfully synced data to {endpoint} with new ID: {newId.GetInt32()}");
+                return newId.GetInt32();
+            }
+
+            _logger.LogError($"No 'id' field found in the response from {endpoint}");
+            throw new Exception($"No 'id' field found in the response from {endpoint}");
+        }
+
+        private async Task<bool> IsDuplicateRecord(string endpoint, JsonElement data)
+        {
+            var tableName = endpoint.Split("/")[1];
+            string uniqueIdentifierField = GetUniqueIdentifierField(tableName);
+
+            if (data.TryGetProperty(uniqueIdentifierField, out var uniqueIdentifier))
+            {
+                string checkUrl = $"{_centralApiBaseUrl}api/{tableName}/search?{uniqueIdentifierField}=" +
+                    (uniqueIdentifier.ValueKind == JsonValueKind.Number ?
+                     uniqueIdentifier.GetInt32().ToString() :
+                     uniqueIdentifier.GetString());
+
+                var checkResponse = await _httpClient.GetAsync(checkUrl);
+
+                if (checkResponse.IsSuccessStatusCode)
+                {
+                    var checkContent = await checkResponse.Content.ReadAsStringAsync();
+                    var existingRecords = JsonSerializer.Deserialize<List<JsonElement>>(checkContent);
+                    return existingRecords != null && existingRecords.Any();
+                }
+            }
+            return false;
+        }
+
+        private JsonElement UpdateForeignKey(JsonElement data, string parentTableName, int newParentId, JsonElement parentRecord)
+        {
+            using (JsonDocument doc = JsonDocument.Parse(data.ToString()))
+            {
+                var root = doc.RootElement;
+                var updatedProperties = new Dictionary<string, object>();
+
+                foreach (var property in root.EnumerateObject())
+                {
+                    if (property.Name.Equals($"{parentTableName}id", StringComparison.OrdinalIgnoreCase))
+                    {
+                        updatedProperties[property.Name] = newParentId;
+                        _logger.LogInformation($"Updated child {property.Name}:{property.Value} ==> {newParentId}");
+                    }
+                    else
+                    {
+                        updatedProperties[property.Name] = property.Value;
+                    }
+                }
+
+                var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
+                var updatedJson = JsonSerializer.Serialize(updatedProperties, jsonOptions);
+                return JsonSerializer.Deserialize<JsonElement>(updatedJson);
+            }
+        }
+
+        private async Task UpdateExportedStatus(string tableName, JsonElement record)
+        {
+            if (record.TryGetProperty("id", out var id))
+            {
+                var updatedRecord = new Dictionary<string, object>();
+                foreach (var property in record.EnumerateObject())
+                {
+                    updatedRecord[property.Name] = property.Value;
+                }
+                updatedRecord["exported"] = 1;
+
+                var jsonContent = JsonSerializer.Serialize(updatedRecord);
+                var updateUrl = $"{_localApiBaseUrl}api/{tableName}/{id.GetInt32()}";
+                var response = await _httpClient.PutAsync(updateUrl, new StringContent(jsonContent, Encoding.UTF8, "application/json"));
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    _logger.LogError($"Failed to update exported status for record {id.GetInt32()} in {tableName}");
+                    throw new Exception($"Failed to update exported status for record {id.GetInt32()} in {tableName}");
+                }
+
+                _logger.LogInformation($"Successfully updated exported status for record {id.GetInt32()} in {tableName}");
+            }
+            else
+            {
+                _logger.LogError($"Record in {tableName} does not have an 'id' field.");
+                throw new Exception($"Record in {tableName} does not have an 'id' field.");
+            }
+        }
+
+        private async Task<List<JsonElement>> FetchChildRecords(string childTableName, string foreignKey, dynamic foreignKeyValue)
+        {
+            _logger.LogInformation($"Fetching related {childTableName} records for {foreignKey} = {foreignKeyValue}...");
+
+            var response = await _httpClient.GetAsync($"{_localApiBaseUrl}api/{childTableName}/search?{foreignKey}={foreignKeyValue}&exported=0");
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogError($"Failed to fetch related {childTableName} records");
+                return new List<JsonElement>();
+            }
+
+            var content = await response.Content.ReadAsStringAsync();
+            var dataList = JsonSerializer.Deserialize<List<JsonElement>>(content);
+
+            return dataList ?? new List<JsonElement>();
+        }
+
+        private async Task<bool> IsParentCasedocsNotCancelled(JsonElement invoicingRecord)
+        {
+            if (invoicingRecord.TryGetProperty("casedocsid", out var caseId))
+            {
+                var casedocs = await FetchChildRecords("casedocs", "id", caseId.GetInt32());
+                return casedocs.Any() && casedocs.All(doc => doc.TryGetProperty("cancelled", out var cancelled) && cancelled.GetString() == "N");
+            }
+            return false;
+        }
+
+        private JsonElement ParseToJsonElement(object data)
+        {
+            var jsonString = JsonSerializer.Serialize(data);
+            using (JsonDocument doc = JsonDocument.Parse(jsonString))
+            {
+                return doc.RootElement.Clone();
+            }
+        }
+
+        private JsonElement RemoveIdField(JsonElement data, string tableName = null)
         {
             try
             {
@@ -243,10 +506,18 @@ namespace ProsecutionDataSync
                                 continue;
                             }
 
-                            // Recursively remove 'id' fields from nested objects
                             if (property.Value.ValueKind == JsonValueKind.Object)
                             {
-                                filteredProperties[property.Name] = RemoveIdField(property.Value);
+                                filteredProperties[property.Name] = RemoveIdField(property.Value, tableName);
+                            }
+                            else if (property.Value.ValueKind == JsonValueKind.Array)
+                            {
+                                var filteredArray = new List<JsonElement>();
+                                foreach (var item in property.Value.EnumerateArray())
+                                {
+                                    filteredArray.Add(RemoveIdField(item, tableName));
+                                }
+                                filteredProperties[property.Name] = filteredArray;
                             }
                             else
                             {
@@ -264,7 +535,7 @@ namespace ProsecutionDataSync
 
                         foreach (var item in root.EnumerateArray())
                         {
-                            filteredArray.Add(RemoveIdField(item));
+                            filteredArray.Add(RemoveIdField(item, tableName));
                         }
 
                         var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
@@ -281,6 +552,60 @@ namespace ProsecutionDataSync
             {
                 _logger.LogError(ex, "Error removing 'id' field from data");
                 return data;
+            }
+        }
+
+        private JsonElement CleanData(JsonElement data)
+        {
+            var cleanedProperties = new Dictionary<string, object>();
+
+            foreach (var property in data.EnumerateObject())
+            {
+                if (property.Value.ValueKind != JsonValueKind.Object && property.Value.ValueKind != JsonValueKind.Array)
+                {
+                    cleanedProperties[property.Name] = property.Value;
+                }
+            }
+
+            var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
+            var cleanedJson = JsonSerializer.Serialize(cleanedProperties, jsonOptions);
+            return JsonSerializer.Deserialize<JsonElement>(cleanedJson);
+        }
+
+        private string GetUniqueIdentifierField(string tableName)
+        {
+            switch (tableName.ToLower())
+            {
+                case "casedetails":
+                    return "caseticket";
+                case "casedocs":
+                    return "casedocid";
+                case "caseresults":
+                    return "casedetailsid";
+                case "eacact":
+                    return "casedocid";
+                case "invoicing":
+                    return "invoicingid";
+                case "receipt":
+                    return "receiptid";
+                default:
+                    throw new Exception($"Unknown table name: {tableName}");
+            }
+        }
+
+        private class ChildTableInfo
+        {
+            public string TableName { get; }
+            public string ForeignKey { get; }
+            public string LocalKey { get; }
+            public bool IsForeignKeyInt { get; }
+
+            public ChildTableInfo(string tableName, string foreignKey, string localKey, bool isForeignKeyInt)
+            {
+                TableName = tableName;
+                ForeignKey = foreignKey;
+                LocalKey = localKey;
+                IsForeignKeyInt = isForeignKeyInt;
             }
         }
     }
