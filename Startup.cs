@@ -124,6 +124,13 @@ namespace ProsecutionDataSync
             // Step 2: Sync related casedocs
             if (caseDetail.TryGetProperty("id", out var caseDetailId))
             {
+                // sync casedetails
+                // Step 0: Sync caseresults (related by casedetailsid)
+                var caseResults = await FetchChildRecords("caseresults", "casedetailsid", caseDetailId.GetInt32());
+                foreach (var caseResult in caseResults)
+                {
+                    await SyncRecord("caseresults", caseResult, newCaseDetailId, "caseid");
+                }
                 var caseDocs = await FetchChildRecords("casedocs", "casedetailsid", caseDetailId.GetInt32());
                 foreach (var caseDoc in caseDocs)
                 {
@@ -152,13 +159,6 @@ namespace ProsecutionDataSync
                     foreach (var eacact in eacacts)
                     {
                         await SyncRecord("eacact", eacact, "caseid", caseDoc.GetProperty("caseid").GetString());
-                    }
-
-                    // Step 6: Sync caseresults (related by casedetailsid)
-                    var caseResults = await FetchChildRecords("caseresults", "caseid", caseDoc.GetProperty("caseid").GetString());
-                    foreach (var caseResult in caseResults)
-                    {
-                        await SyncRecord("caseresults", caseResult, newCaseDetailId, "caseid");
                     }
                 }
             }
