@@ -62,7 +62,7 @@ namespace ProsecutionDataSync
     {
         private readonly ILogger<SyncService> _logger;
         private readonly HttpClient _httpClient;
-        private readonly string _localApiBaseUrl = "https://localhost:44365/";
+        private readonly string _localApiBaseUrl = "http://localhost:4444/";
         private readonly string _centralApiBaseUrl = "https://kenload.kenha.co.ke:4444/";
         private string _jwtToken;
 
