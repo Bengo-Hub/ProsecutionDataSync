@@ -62,7 +62,7 @@ namespace ProsecutionDataSync
     {
         private readonly ILogger<SyncService> _logger;
         private readonly HttpClient _httpClient;
-        private readonly string _localApiBaseUrl = "https://localhost:44365/";
+        private readonly string _localApiBaseUrl = "http://localhost:4444/";
         private readonly string _centralApiBaseUrl = "https://kenload.kenha.co.ke:4444/";
         private string _jwtToken;
 
@@ -79,16 +79,31 @@ namespace ProsecutionDataSync
                 try
                 {
                     _logger.LogInformation("Starting data sync process...");
+
+                    // Always get a fresh token for each sync attempt
                     await RetryWithExponentialBackoff(async () => await LoginAndGetToken(), "LoginAndGetToken", stoppingToken);
+
+                    // Perform the hierarchical sync
                     await RetryWithExponentialBackoff(async () => await SyncDataHierarchically(), "SyncDataHierarchically", stoppingToken);
-                    _logger.LogInformation("Data sync process completed successfully.");
+
+                    _logger.LogInformation("Data sync process completed successfully. Waiting for next cycle...");
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Error occurred while syncing data");
                 }
 
-                await Task.Delay(TimeSpan.FromMinutes(5), stoppingToken); // Sync every 5 minutes
+                // Wait for 5 minutes before checking again
+                try
+                {
+                    await Task.Delay(TimeSpan.FromMinutes(5), stoppingToken);
+                }
+                catch (TaskCanceledException)
+                {
+                    // This is expected when the service is stopping
+                    _logger.LogInformation("Sync service is stopping...");
+                    break;
+                }
             }
         }
 
@@ -114,7 +129,6 @@ namespace ProsecutionDataSync
 
             _logger.LogInformation("Hierarchical data sync completed.");
         }
-
         private async Task ProcessCaseHierarchy(JsonElement caseDetail)
         {
             // Step 1: Sync the case detail itself
@@ -124,13 +138,6 @@ namespace ProsecutionDataSync
             // Step 2: Sync related casedocs
             if (caseDetail.TryGetProperty("id", out var caseDetailId))
             {
-                // sync casedetails
-                // Step 0: Sync caseresults (related by casedetailsid)
-                var caseResults = await FetchChildRecords("caseresults", "casedetailsid", caseDetailId.GetInt32());
-                foreach (var caseResult in caseResults)
-                {
-                    await SyncRecord("caseresults", caseResult, newCaseDetailId, "caseid");
-                }
                 var caseDocs = await FetchChildRecords("casedocs", "casedetailsid", caseDetailId.GetInt32());
                 foreach (var caseDoc in caseDocs)
                 {
@@ -152,13 +159,6 @@ namespace ProsecutionDataSync
                         {
                             await SyncRecord("receipt", receipt, newInvoicingId, "invoicingid");
                         }
-                    }
-
-                    // Step 5: Sync eacact records (related by caseid)
-                    var eacacts = await FetchChildRecords("eacact", "caseid", caseDoc.GetProperty("caseid").GetString());
-                    foreach (var eacact in eacacts)
-                    {
-                        await SyncRecord("eacact", eacact, "caseid", caseDoc.GetProperty("caseid").GetString());
                     }
                 }
             }
@@ -183,7 +183,6 @@ namespace ProsecutionDataSync
                 }
             }
         }
-
         private async Task<int> SyncRecord(string tableName, JsonElement record, dynamic newParentId = null, string foreignKeyField = null)
         {
             try
@@ -201,14 +200,19 @@ namespace ProsecutionDataSync
                 var cleanedData = CleanData(dataToSend);
                 var dataWithoutId = RemoveIdField(cleanedData);
 
-                // Check for duplicates
-                if (await IsDuplicateRecord(tableName, dataWithoutId))
+                // Skip duplicate checking for caseresults and eacact
+                bool shouldCheckDuplicates = !(tableName.Equals("caseresults", StringComparison.OrdinalIgnoreCase) ||
+                                            tableName.Equals("eacact", StringComparison.OrdinalIgnoreCase));
+
+                // Check for duplicates (skip for caseresults and eacact)
+                if (shouldCheckDuplicates && await IsDuplicateRecord(tableName, dataWithoutId))
                 {
                     _logger.LogWarning($"Duplicate record detected in {tableName}. Skipping...");
                     return -1;
                 }
                 _logger.LogInformation($"Sending api data: {dataWithoutId}");
 
+                // Rest of the method remains the same...
                 // Post to central API
                 var response = await _httpClient.PostAsync(
                     $"{_centralApiBaseUrl}api/{tableName}",
@@ -247,19 +251,21 @@ namespace ProsecutionDataSync
             {
                 var root = doc.RootElement;
                 var updatedProperties = new Dictionary<string, object>();
+                _logger.LogInformation($"Mapping FK for {foreignKeyField}");
 
                 foreach (var property in root.EnumerateObject())
                 {
-                    if (property.Name.Equals(foreignKeyField, StringComparison.OrdinalIgnoreCase) && !property.Name.Equals("caseid"))
+                    if (property.Name.Equals(foreignKeyField, StringComparison.OrdinalIgnoreCase))
                     {
                         updatedProperties[property.Name] = newValue;
+                        _logger.LogInformation($" {property.Name}:{property.Value}<==>{newValue}");
                     }
                     else
                     {
                         updatedProperties[property.Name] = property.Value;
+                        _logger.LogInformation($" {property.Name}:{property.Value}");
                     }
                 }
-
                 var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
                 var updatedJson = JsonSerializer.Serialize(updatedProperties, jsonOptions);
                 return JsonSerializer.Deserialize<JsonElement>(updatedJson);
@@ -343,6 +349,13 @@ namespace ProsecutionDataSync
 
         private async Task<bool> IsDuplicateRecord(string tableName, JsonElement data)
         {
+            // Skip duplicate checking for caseresults and eacact
+            if (tableName.Equals("caseresults", StringComparison.OrdinalIgnoreCase) ||
+                tableName.Equals("eacact", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
             string uniqueField = GetUniqueIdentifierField(tableName);
 
             if (!data.TryGetProperty(uniqueField, out var uniqueValue))
@@ -350,6 +363,7 @@ namespace ProsecutionDataSync
                 return false; // If no unique field, assume not duplicate
             }
 
+            // Rest of the duplicate checking logic...
             string checkUrl;
             if (uniqueValue.ValueKind == JsonValueKind.Number)
             {
@@ -372,7 +386,6 @@ namespace ProsecutionDataSync
 
             return existingRecords != null && existingRecords.Any();
         }
-
         private string GetUniqueIdentifierField(string tableName)
         {
             switch (tableName.ToLower())
