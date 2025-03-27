@@ -70,7 +70,6 @@ namespace ProsecutionDataSync
         {
             _logger = logger;
             _httpClient = new HttpClient();
-            _httpClient.Timeout = TimeSpan.FromMinutes(5); // Increase timeout for large data transfers
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -85,10 +84,7 @@ namespace ProsecutionDataSync
                     await RetryWithExponentialBackoff(async () => await LoginAndGetToken(), "LoginAndGetToken", stoppingToken);
 
                     // Perform the hierarchical sync
-                    //await RetryWithExponentialBackoff(async () => await SyncDataHierarchically(), "SyncDataHierarchically", stoppingToken);
-
-                    // Check for orphaned records (children added after parents were synced)
-                    await RetryWithExponentialBackoff(async () => await SyncOrphanedRecords(), "SyncOrphanedRecords", stoppingToken);
+                    await RetryWithExponentialBackoff(async () => await SyncDataHierarchically(), "SyncDataHierarchically", stoppingToken);
 
                     _logger.LogInformation("Data sync process completed successfully. Waiting for next cycle...");
                 }
@@ -133,104 +129,6 @@ namespace ProsecutionDataSync
 
             _logger.LogInformation("Hierarchical data sync completed.");
         }
-
-        private async Task SyncOrphanedRecords()
-        {
-            _logger.LogInformation("Checking for orphaned records that need syncing...");
-
-            // Check for orphaned receipts (where parent invoices might have been synced earlier)
-            await SyncOrphanedChildRecords("receipt", "invoicingid", "invoicing");
-
-            // Check for orphaned invoices (where parent casedocs might have been synced earlier)
-            await SyncOrphanedChildRecords("invoicing", "casedocsid", "casedocs", docNameFilter: "Load Correction Memo");
-
-            // Check for orphaned casedocs (where parent casedetails might have been synced earlier)
-            await SyncOrphanedChildRecords("casedocs", "casedetailsid", "casedetails");
-
-            // Check for orphaned eacact records
-            await SyncOrphanedChildRecords("eacact", "caseid", "casedetails", isStringKey: true);
-
-            // Check for orphaned caseresults
-            await SyncOrphanedChildRecords("caseresults", "casedetailsid", "casedetails");
-
-            _logger.LogInformation("Orphaned records sync completed.");
-        }
-
-        private async Task SyncOrphanedChildRecords(string childTableName, string foreignKeyField, string parentTableName,
-                                                   string docNameFilter = null, bool isStringKey = false)
-        {
-            var orphanedRecords = await FetchRecordsToSync(childTableName);
-
-            foreach (var record in orphanedRecords)
-            {
-                try
-                {
-                    if (!record.TryGetProperty("caseid", out var caseId))
-                    {
-                        _logger.LogWarning($"Orphaned {childTableName} record is missing caseid");
-                        continue;
-                    }
-
-                    // Find potential parent in central API
-                    var parentRecords = await FetchFromCentralApi(parentTableName, $"caseid={Uri.EscapeDataString(caseId.GetString())}");
-
-                    if (!parentRecords.Any())
-                    {
-                        _logger.LogInformation($"No parent found in central API for {childTableName} with caseid: {caseId}");
-                        continue;
-                    }
-
-                    // Apply additional filtering if needed (e.g., for Load Correction Memo)
-                    if (!string.IsNullOrEmpty(docNameFilter))
-                    {
-                        parentRecords = parentRecords.Where(p =>
-                            p.TryGetProperty("docname", out var docName) &&
-                            docName.GetString().Contains(docNameFilter, StringComparison.OrdinalIgnoreCase) ||
-                            docName.GetString().Contains("Invoice", StringComparison.OrdinalIgnoreCase))
-                            .ToList();
-                    }
-
-                    // Find the best parent candidate (one without existing children)
-                    JsonElement? bestParent = null;
-                    foreach (var parent in parentRecords)
-                    {
-                        if (parent.TryGetProperty("id", out var parentId))
-                        {
-                            var children = await FetchFromCentralApi(childTableName, $"{foreignKeyField}={(isStringKey ? Uri.EscapeDataString(parentId.GetString()) : parentId.GetInt32().ToString())}");
-                            if (!children.Any())
-                            {
-                                bestParent = parent;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (bestParent == null)
-                    {
-                        _logger.LogInformation($"No suitable parent found without existing children for {childTableName} with caseid: {caseId}");
-                        continue;
-                    }
-
-                    // Get the parent ID
-                    var bestParentId = bestParent.Value.GetProperty("id");
-
-                    // Sync the child record with the found parent ID
-                    if (isStringKey)
-                    {
-                        await SyncRecord(childTableName, record, bestParentId.GetString(), foreignKeyField);
-                    }
-                    else
-                    {
-                        await SyncRecord(childTableName, record, bestParentId.GetInt32(), foreignKeyField);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, $"Error processing orphaned {childTableName} record");
-                }
-            }
-        }
-
         private async Task ProcessCaseHierarchy(JsonElement caseDetail)
         {
             // Step 1: Sync the case detail itself
@@ -247,24 +145,19 @@ namespace ProsecutionDataSync
                     int newCaseDocId = await SyncRecord("casedocs", caseDoc, newCaseDetailId, "casedetailsid");
                     if (newCaseDocId == -1) continue;
 
-                    // Step 3: Sync invoicing for this casedoc (only for Load Correction Memo)
-                    if (caseDoc.TryGetProperty("docname", out var docName) &&
-                        docName.GetString().Contains("Load Correction Memo", StringComparison.OrdinalIgnoreCase) ||
-                        docName.GetString().Contains("Invoice", StringComparison.OrdinalIgnoreCase))
+                    // Step 3: Sync invoicing for this casedoc
+                    var invoicings = await FetchChildRecords("invoicing", "casedocsid", caseDoc.GetProperty("id").GetInt32());
+                    foreach (var invoicing in invoicings)
                     {
-                        var invoicings = await FetchChildRecords("invoicing", "casedocsid", caseDoc.GetProperty("id").GetInt32());
-                        foreach (var invoicing in invoicings)
-                        {
-                            // Sync the invoicing
-                            int newInvoicingId = await SyncRecord("invoicing", invoicing, newCaseDocId, "casedocsid");
-                            if (newInvoicingId == -1) continue;
+                        // Sync the invoicing
+                        int newInvoicingId = await SyncRecord("invoicing", invoicing, newCaseDocId, "casedocsid");
+                        if (newInvoicingId == -1) continue;
 
-                            // Step 4: Sync receipts for this invoicing
-                            var receipts = await FetchChildRecords("receipt", "invoicingid", invoicing.GetProperty("id").GetInt32());
-                            foreach (var receipt in receipts)
-                            {
-                                await SyncRecord("receipt", receipt, newInvoicingId, "invoicingid");
-                            }
+                        // Step 4: Sync receipts for this invoicing
+                        var receipts = await FetchChildRecords("receipt", "invoicingid", invoicing.GetProperty("id").GetInt32());
+                        foreach (var receipt in receipts)
+                        {
+                            await SyncRecord("receipt", receipt, newInvoicingId, "invoicingid");
                         }
                     }
                 }
@@ -290,7 +183,6 @@ namespace ProsecutionDataSync
                 }
             }
         }
-
         private async Task<int> SyncRecord(string tableName, JsonElement record, dynamic newParentId = null, string foreignKeyField = null)
         {
             try
@@ -298,18 +190,7 @@ namespace ProsecutionDataSync
                 // Prepare the data for syncing
                 var dataToSend = record;
 
-                // For child records, try to find parent in central API if not provided
-                if (newParentId == null && foreignKeyField != null)
-                {
-                    newParentId = await FindParentInCentralApi(tableName, record, foreignKeyField);
-                    if (newParentId == null)
-                    {
-                        _logger.LogWarning($"Could not find parent in central API for {tableName} record");
-                        return -1;
-                    }
-                }
-
-                // Update foreign key if parent ID is found
+                // Update foreign key if parent ID is provided
                 if (newParentId != null && !string.IsNullOrEmpty(foreignKeyField))
                 {
                     dataToSend = UpdateForeignKey(dataToSend, foreignKeyField, newParentId);
@@ -318,8 +199,6 @@ namespace ProsecutionDataSync
                 // Clean and remove ID field
                 var cleanedData = CleanData(dataToSend);
                 var dataWithoutId = RemoveIdField(cleanedData);
-
-                _logger.LogWarning($"DSending data:{dataWithoutId} to api/{tableName}");
 
                 // Skip duplicate checking for caseresults and eacact
                 bool shouldCheckDuplicates = !(tableName.Equals("caseresults", StringComparison.OrdinalIgnoreCase) ||
@@ -331,7 +210,9 @@ namespace ProsecutionDataSync
                     _logger.LogWarning($"Duplicate record detected in {tableName}. Skipping...");
                     return -1;
                 }
+                _logger.LogInformation($"Sending api data: {dataWithoutId}");
 
+                // Rest of the method remains the same...
                 // Post to central API
                 var response = await _httpClient.PostAsync(
                     $"{_centralApiBaseUrl}api/{tableName}",
@@ -361,115 +242,6 @@ namespace ProsecutionDataSync
             {
                 _logger.LogError(ex, $"Error syncing record to {tableName}");
                 return -1;
-            }
-        }
-
-        private async Task<dynamic> FindParentInCentralApi(string childTableName, JsonElement childRecord, string foreignKeyField)
-        {
-            try
-            {
-                // Get the caseid from the child record
-                if (!childRecord.TryGetProperty("caseid", out var caseId))
-                {
-                    _logger.LogWarning($"Child record in {childTableName} has no caseid field");
-                    return null;
-                }
-
-                string caseIdValue = caseId.GetString();
-                string parentTableName = GetParentTableName(childTableName);
-
-                if (parentTableName == null)
-                {
-                    _logger.LogWarning($"No parent table defined for {childTableName}");
-                    return null;
-                }
-
-                // Special handling for different child-parent relationships
-                if (childTableName.Equals("receipt", StringComparison.OrdinalIgnoreCase))
-                {
-                    // For receipts, find an invoice with the same caseid that doesn't have any receipts
-                    var invoices = await FetchFromCentralApi("invoicing", $"caseid={Uri.EscapeDataString(caseIdValue)}");
-
-                    foreach (var invoice in invoices)
-                    {
-                        if (invoice.TryGetProperty("id", out var invoiceId))
-                        {
-                            // Check if this invoice has any receipts
-                            var receipts = await FetchFromCentralApi("receipt", $"invoicingid={invoiceId.GetInt32()}");
-                            if (!receipts.Any())
-                            {
-                                return invoiceId.GetInt32();
-                            }
-                        }
-                    }
-                }
-                else if (childTableName.Equals("invoicing", StringComparison.OrdinalIgnoreCase))
-                {
-                    // For invoices, find a casedoc with docname "Load Correction Memo" and same caseid
-                    var caseDocs = await FetchFromCentralApi("casedocs", $"caseid={Uri.EscapeDataString(caseIdValue)}");
-
-                    foreach (var caseDoc in caseDocs)
-                    {
-                        if (caseDoc.TryGetProperty("docname", out var docName) &&
-                            docName.GetString().Equals("Load Correction Memo", StringComparison.OrdinalIgnoreCase) &&
-                            caseDoc.TryGetProperty("id", out var caseDocId))
-                        {
-                            // Check if this casedoc has any invoices
-                            var invoices = await FetchFromCentralApi("invoicing", $"casedocsid={caseDocId.GetInt32()}");
-                            if (!invoices.Any())
-                            {
-                                return caseDocId.GetInt32();
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    // For other child records, just find the first parent with matching caseid
-                    var parents = await FetchFromCentralApi(parentTableName, $"caseid={Uri.EscapeDataString(caseIdValue)}");
-
-                    if (parents.Any())
-                    {
-                        if (parents[0].TryGetProperty("id", out var parentId))
-                        {
-                            return parentId.GetInt32();
-                        }
-                    }
-                }
-
-                return null;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, $"Error finding parent in central API for {childTableName}");
-                return null;
-            }
-        }
-
-        private async Task<List<JsonElement>> FetchFromCentralApi(string tableName, string filter)
-        {
-            var response = await _httpClient.GetAsync($"{_centralApiBaseUrl}api/{tableName}/search?{filter}");
-
-            if (!response.IsSuccessStatusCode)
-            {
-                _logger.LogError($"Failed to fetch {tableName} records from central API");
-                return new List<JsonElement>();
-            }
-
-            var content = await response.Content.ReadAsStringAsync();
-            return JsonSerializer.Deserialize<List<JsonElement>>(content) ?? new List<JsonElement>();
-        }
-
-        private string GetParentTableName(string childTableName)
-        {
-            switch (childTableName.ToLower())
-            {
-                case "casedocs": return "casedetails";
-                case "invoicing": return "casedocs";
-                case "receipt": return "invoicing";
-                case "eacact": return "casedetails";
-                case "caseresults": return "casedetails";
-                default: return null;
             }
         }
 
@@ -503,7 +275,7 @@ namespace ProsecutionDataSync
         private async Task<List<JsonElement>> FetchRecordsToSync(string tableName)
         {
             _logger.LogInformation($"Fetching {tableName} records to sync...");
-            var response = await _httpClient.GetAsync($"{_localApiBaseUrl}api/{tableName}/search?exported=0");
+            var response = await _httpClient.GetAsync($"{_localApiBaseUrl}api/{tableName}/search?exported=0&hasEacactOrInvoicing=true");
 
             if (!response.IsSuccessStatusCode)
             {
@@ -591,6 +363,7 @@ namespace ProsecutionDataSync
                 return false; // If no unique field, assume not duplicate
             }
 
+            // Rest of the duplicate checking logic...
             string checkUrl;
             if (uniqueValue.ValueKind == JsonValueKind.Number)
             {
@@ -613,7 +386,6 @@ namespace ProsecutionDataSync
 
             return existingRecords != null && existingRecords.Any();
         }
-
         private string GetUniqueIdentifierField(string tableName)
         {
             switch (tableName.ToLower())
